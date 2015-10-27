@@ -6,6 +6,7 @@
 (require racket/set)
 (require racket/match)
 (require racket/promise)
+(require racket/vector)
 (require plot/utils) ;; for vector utilities
 
 (require prospect)
@@ -469,20 +470,30 @@
     (define-values (top-right bottom-right bottom-left)
       (three-corners top-left size))
     (define r (v- moved-top-left top-left))
-    (define t
-      (apply min
-             (for/list [(p (in-list (list top-left top-right bottom-right bottom-left)))]
-               (min (or (segment-intersection-time p r solid-top-left solid-top-right) 1)
-                    (or (segment-intersection-time p r solid-top-left solid-bottom-left) 1)
-                    (or (segment-intersection-time p r solid-top-right solid-bottom-right) 1)
-                    (or (segment-intersection-time p r solid-bottom-left solid-bottom-right) 1)))))
-    (v+ top-left (v* r t)))
+    (define-values (t cancellation-factor)
+      (let ((candidates
+             (for*/list [(p (in-list (list top-left top-right bottom-right bottom-left)))
+                         (q (in-list
+                             (list (list solid-top-left solid-top-right (vector 1 0))
+                                   (list solid-top-left solid-bottom-left (vector 0 1))
+                                   (list solid-top-right solid-bottom-right (vector 0 1))
+                                   (list solid-bottom-left solid-bottom-right (vector 1 0)))))]
+               (match-define (list q0 q1 cancellation-factor) q)
+               (list (or (segment-intersection-time p r q0 q1) 1) cancellation-factor))))
+        (match-define (list t cancellation-factor) (car (sort candidates < #:key car)))
+        (values t cancellation-factor)))
+    (values (v+ top-left (v* r t)) cancellation-factor))
 
   (define (clip-movement-by-solids s p0 p1 size)
-    (for/fold [(p1 p1)]
+    (for/fold [(p1 p1) (cancellation-factor (vector 1 1))]
               [((id g) (in-hash (physics-state-configs s)))
                #:when (game-piece-has-attribute? g 'solid)]
-      (clip-movement-by p0 p1 size (piece-pos s id) (game-piece-configuration-size g))))
+      (define-values (p1* additional-cancellation-factor)
+        (clip-movement-by p0 p1 size (piece-pos s id) (game-piece-configuration-size g)))
+      (values p1*
+              (if (v= p1 p1*)
+                  cancellation-factor
+                  (vector-map * cancellation-factor additional-cancellation-factor)))))
 
   (define (touched-during-movement? top-left moved-top-left size touchable-top-left touchable-size)
     (define r (v- moved-top-left top-left))
@@ -537,10 +548,12 @@
                     vel0]))
 
     (define pos1 (v+ pos0 (v* (v+ vel1 imp0) (* impulse-multiplier elapsed-ms))))
-    (define final-pos (clip-movement-by-solids state-at-beginning-of-frame pos0 pos1 size))
-    ;; TODO: figure out how to cancel just the component of velocity blocked by the obstacle(s)
-    ;; - which will avoid the "sticking to the wall" artifact
-    (define final-vel (if (v= pos1 final-pos) vel1 (vector 0 0))) ;; stop at collision
+    (define-values (final-pos final-cancellation-factor)
+      (clip-movement-by-solids state-at-beginning-of-frame pos0 pos1 size))
+    ;; TODO: This doesn't work because the impulse sticks around for the next tick.
+    ;; It's as if we need a kind of "find-support" for horizonal movement too.
+    ;; Or to try moving "naturally" first and then do a separate impulse move.
+    (define final-vel (vector-map * vel1 final-cancellation-factor)) ;; stop at collision
     (define touchables
       (touchables-touched-during-movement state-at-beginning-of-frame pos0 final-pos size))
     (sequence-transitions
